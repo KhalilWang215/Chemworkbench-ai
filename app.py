@@ -34,7 +34,7 @@ def save_cache(cache_data):
 
 cache = load_cache()
 
-# --- 本地离线高频中文化学词典（秒级出图，免耗Token） ---
+# --- 本地离线高频中文化学词典 ---
 LOCAL_CHEMICAL_DB = {
     # 常用抗生素与药物
     "阿莫西林": {"smiles": "CC1(C(N2C(S1)C(C2=O)NC(=O)C(c3ccc(O)cc3)N)C(=O)O)C", "title": "阿莫西林 (Amoxicillin)", "iupac": "(2S,5R,6R)-6-[[(2R)-2-amino-2-(4-hydroxyphenyl)acetyl]amino]-3,3-dimethyl-7-oxo-4-thia-1-azabicyclo[3.2.0]heptane-2-carboxylic acid"},
@@ -57,6 +57,7 @@ LOCAL_CHEMICAL_DB = {
     "褪黑素": {"smiles": "CC(=O)NCCC1=CNc2c1cc(OC)cc2", "title": "褪黑素 (Melatonin)", "iupac": "N-[2-(5-methoxy-1H-indol-3-yl)ethyl]acetamide"},
     "维生素c": {"smiles": "C1(=C(C(=O)OC1C(CO)O)O)O", "title": "维生素C / 抗坏血酸 (Vitamin C)", "iupac": "(5R)-[(1S)-1,2-dihydroxyethyl]-3,4-dihydroxyfuran-2(5H)-one"},
     "抗坏血酸": {"smiles": "C1(=C(C(=O)OC1C(CO)O)O)O", "title": "维生素C / 抗坏血酸 (Vitamin C)", "iupac": "(5R)-[(1S)-1,2-dihydroxyethyl]-3,4-dihydroxyfuran-2(5H)-one"},
+    "对甲基苯丙胺": {"smiles": "CC(NC)Cc1ccc(C)cc1", "title": "4-甲基苯丙胺 (4-Methylamphetamine)", "iupac": "1-(4-methylphenyl)propan-2-amine"},
     
     # 常用溶剂与基础分子
     "乙醇": {"smiles": "CCO", "title": "乙醇 / 酒精 (Ethanol)", "iupac": "ethanol"},
@@ -85,55 +86,53 @@ for k, v in LOCAL_CHEMICAL_DB.items():
     except Exception:
         pass
 
-# --- 基于官方规范的 requests 通信函数（初版稳定内核） ---
-def call_deepseek_api(endpoint_url: str, api_key: str, model_name: str, prompt: str, timeout: int = 60):
-    clean_key = str(api_key).strip(" []'\"`\n\r\t")
+# --- AI 生僻名称识别转换（带长超时与自动重试） ---
+def resolve_name_with_ai(query: str, endpoint_url: str, key: str, model: str):
+    clean_key = str(key).strip(" []'\"`\n\r\t")
     clean_url = str(endpoint_url).strip(" []'\"`\n\r\t")
     
+    prompt = f"""你是一名化学专家。请将用户输入的化学名称（中文/英文/俗名/商品名/CAS号）快速转换为规范 SMILES 字符串。
+待解析: "{query}"
+
+必须仅输出一个紧凑的 JSON 对象（不要 markdown 标记，不要任何附加字）：
+{{"smiles": "标准SMILES", "title": "规范名称", "iupac": "IUPAC命名"}}
+若不是确切分子，输出: {{"error": "not_found"}}"""
+
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {clean_key}"
     }
     payload = {
-        "model": model_name,
+        "model": model,
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.2
+        "temperature": 0.1,
+        "max_tokens": 150
     }
-    try:
-        resp = requests.post(clean_url, headers=headers, json=payload, timeout=timeout)
-        if resp.status_code == 200:
-            return resp.json()["choices"][0]["message"]["content"], None
-        else:
-            return None, f"HTTP {resp.status_code}: {resp.text}"
-    except Exception as e:
-        return None, f"网络请求出错: {str(e)}"
-
-# --- AI 生僻名称识别转换 ---
-def resolve_name_with_ai(query: str, endpoint_url: str, key: str, model: str):
-    prompt = f"""你是一名化学专家。请将用户输入的化学名称（中文/英文/俗名/商品名/CAS号）解析转换为标准规范 SMILES 字符串。
-待解析名称: "{query}"
-
-必须仅输出一个严格合法的 JSON 对象，不加任何 Markdown 代码块标签与多余文字：
-{{"smiles": "标准SMILES", "title": "规范名称", "iupac": "IUPAC命名"}}
-如果不是确定的化学分子，请输出: {{"error": "not_found"}}"""
-
-    content, err = call_deepseek_api(endpoint_url, key, model, prompt, timeout=25)
-    if err:
-        return None, err
-    try:
-        text = content.strip()
-        # 清除 markdown 标记
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        if match:
-            text = match.group(0)
-        data = json.loads(text)
-        if "smiles" in data and data["smiles"]:
-            test_mol = Chem.MolFromSmiles(data["smiles"])
-            if test_mol:
-                return data, None
-        return None, "AI 返回的结构未能通过化学有效性校验"
-    except Exception as ex:
-        return None, f"解析异常: {ex}"
+    
+    # 尝试请求（连接超时 5s，读取超时 50s）
+    for attempt in range(2):
+        try:
+            resp = requests.post(clean_url, headers=headers, json=payload, timeout=(5, 50))
+            if resp.status_code == 200:
+                text = resp.json()["choices"][0]["message"]["content"].strip()
+                match = re.search(r"\{.*\}", text, re.DOTALL)
+                if match:
+                    text = match.group(0)
+                data = json.loads(text)
+                if "smiles" in data and data["smiles"]:
+                    test_mol = Chem.MolFromSmiles(data["smiles"])
+                    if test_mol:
+                        return data, None
+                return None, "AI 返回的结构未能通过化学有效性校验"
+            else:
+                return None, f"HTTP {resp.status_code}: {resp.text}"
+        except requests.exceptions.Timeout:
+            if attempt == 0:
+                continue
+            return None, "网络请求超时（API服务器高峰排队），请重试或直接输入 SMILES"
+        except Exception as e:
+            return None, f"连接异常: {str(e)}"
+    return None, "服务暂时不可达"
 
 # --- 侧边栏 ---
 with st.sidebar:
@@ -148,7 +147,6 @@ with st.sidebar:
     st.markdown("---")
     st.header("⚙️ AI 专家模型配置")
     
-    # 锁定官方标准接口，杜绝填错 URL 造成 404
     provider = st.selectbox(
         "选择服务商",
         options=["DeepSeek 官方 (推荐)", "自定义服务商"]
@@ -158,13 +156,13 @@ with st.sidebar:
         final_api_url = "https://api.deepseek.com/v1/chat/completions"
         model_choice = st.selectbox(
             "选择模型版本",
-            options=["deepseek-flash (V4.1 Flash 最新极速)", "deepseek-chat (V3 通用旗舰)"],
+            options=["deepseek-chat (通用旗舰，响应极稳)", "deepseek-flash (极速体验)"],
             index=0
         )
-        final_model_name = "deepseek-flash" if "flash" in model_choice else "deepseek-chat"
+        final_model_name = "deepseek-chat" if "chat" in model_choice else "deepseek-flash"
     else:
         final_api_url = st.text_input("API URL", value="https://api.deepseek.com/v1/chat/completions")
-        final_model_name = st.text_input("模型名称", value="deepseek-flash")
+        final_model_name = st.text_input("模型名称", value="deepseek-chat")
 
     raw_key = st.text_input("API Key", type="password", placeholder="填入 sk-xxxx 密钥")
     final_api_key = raw_key.strip(" []'\"`\n\r\t")
@@ -179,7 +177,7 @@ with st.sidebar:
 st.title("🧪 AI 化学分子多维工作台")
 st.caption("支持输入：**中英文俗名/商品名/学名**（如阿莫西林、青蒿素、利多卡因、柠檬酸） / **SMILES 结构式**")
 
-# 输入框初值
+# 初值逻辑
 default_input = "CC(=O)Nc1ccc(O)cc1"
 if selected_history != "-- 请选择 --":
     default_input = selected_history
@@ -213,9 +211,9 @@ if user_query:
             else:
                 meta_info = {"title": "自主输入分子骨架", "iupac": "由专家推导或系统自动分析"}
             
-    # 3. 词典未命中时，调用 DeepSeek 4.1 Flash 智能转换
+    # 3. 词典未命中时，调用 AI 进行智能转换
     if mol is None and final_api_key:
-        with st.spinner(f"正在让 AI 智能识别“{clean_q}”的化学拓扑结构..."):
+        with st.spinner(f"正在让 AI 智能识别“{clean_q}”的化学拓扑结构（首屏解析中）..."):
             ai_data, err_msg = resolve_name_with_ai(clean_q, final_api_url, final_api_key, final_model_name)
             if ai_data and "smiles" in ai_data:
                 mol = Chem.MolFromSmiles(ai_data["smiles"])
@@ -237,7 +235,7 @@ if user_query:
 # --- 正常展示区域 ---
 if mol:
     raw_formula = rdMolDescriptors.CalcMolFormula(mol)
-    subscript_formula = to_subscript_formula(raw_formula)  # 下标化化学式
+    subscript_formula = to_subscript_formula(raw_formula)
     
     mw = Descriptors.MolWt(mol)
     logp = Descriptors.MolLogP(mol)
@@ -252,7 +250,7 @@ if mol:
     cached_entry = cache.get(current_smiles, {})
     ai_report_cached = cached_entry.get("ai_report", "")
 
-    # --- 模块 1：常规基础性质（已去掉蓝色提示框） ---
+    # --- 模块 1：常规基础性质 ---
     with st.expander("📖 1. 基础信息与通用物理化学性质（普适概览）", expanded=True):
         col_meta1, col_meta2 = st.columns([1, 1])
         with col_meta1:
@@ -302,7 +300,7 @@ if mol:
         m7.metric("Bertz 拓扑复杂度", f"{bertz:.1f}", help="骨架及杂原子连接复杂度")
         m8.metric("非氢重原子数", heavy_atoms)
 
-    # --- 模块 4：AI 专家研报推演 ---
+    # --- 模块 4：AI 专家研报推演（流式打字机传输，拒绝断联） ---
     st.markdown("---")
     with st.expander("🤖 5. 专家机理推演与逆合成路径", expanded=True):
         col_btn1, col_btn2 = st.columns([1, 4])
@@ -316,8 +314,7 @@ if mol:
             if not final_api_key:
                 st.warning("请在左侧侧边栏填入 API Key 才能调用 AI 模型生成。")
             else:
-                with st.spinner("DeepSeek 正在解析反应切断位点与机理..."):
-                    prompt = f"""
+                prompt = f"""
 你是一名资深的有机化学与药物化学家。请基于以下经由化学信息学严密计算的数据，对目标分子做出一份详尽的专家推演研报：
 
 【分子特征】
@@ -344,9 +341,46 @@ if mol:
 1. 指出合成过程中的副反应、区域/化学选择性控制难点。
 2. 实验安全注意点（如放热控制、有毒中间体、产物纯化重结晶建议）。
 """
-                    content_out, req_err = call_deepseek_api(final_api_url, final_api_key, final_model_name, prompt)
-                    if not req_err and content_out:
-                        ai_report_cached = content_out
+                headers = {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {final_api_key}"
+                }
+                # 开启 stream: True 流式实时吐字
+                payload = {
+                    "model": final_model_name,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.2,
+                    "stream": True
+                }
+                
+                try:
+                    # 连接超时 5s，单块读取超时 30s
+                    resp = requests.post(final_api_url, headers=headers, json=payload, stream=True, timeout=(5, 30))
+                    if resp.status_code == 200:
+                        report_placeholder = st.empty()
+                        full_content = ""
+                        
+                        # 流式迭代接收数据块
+                        for line in resp.iter_lines():
+                            if line:
+                                decoded_line = line.decode('utf-8')
+                                if decoded_line.startswith("data: "):
+                                    json_str = decoded_line[6:].strip()
+                                    if json_str == "[DONE]":
+                                        break
+                                    try:
+                                        chunk_obj = json.loads(json_str)
+                                        delta_content = chunk_obj["choices"][0]["delta"].get("content", "")
+                                        full_content += delta_content
+                                        # 实时渲染打字机效果
+                                        report_placeholder.markdown(full_content + "▌")
+                                    except Exception:
+                                        continue
+                        
+                        # 最终完成渲染并保存
+                        report_placeholder.markdown(full_content)
+                        ai_report_cached = full_content
+                        
                         cache[current_smiles] = {
                             "query_name": meta_info.get('title', user_query),
                             "formula": subscript_formula,
@@ -356,13 +390,18 @@ if mol:
                             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         }
                         save_cache(cache)
-                        st.rerun()
                     else:
-                        st.error(f"API 请求失败: {req_err}")
+                        st.error(f"API 请求失败 (HTTP {resp.status_code}): {resp.text}")
+                except requests.exceptions.Timeout:
+                    st.error("网络连接超时：AI 响应中断，请稍后重试。")
+                except Exception as e:
+                    st.error(f"请求异常: {str(e)}")
 
-        # 展示研报内容与导出功能
-        if ai_report_cached:
+        # 展示已缓存的研报内容与导出功能
+        elif ai_report_cached:
             st.markdown(ai_report_cached)
+            
+        if ai_report_cached:
             st.markdown("---")
             markdown_report = f"""# 化学分子多维分析报告：{meta_info.get('title', user_query)}
 - **生成时间**：{cache.get(current_smiles, {}).get('timestamp', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))}
